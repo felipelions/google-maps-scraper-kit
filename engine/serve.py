@@ -71,6 +71,22 @@ MAX_BODY = 1 << 20
 LOCAL = r"(localhost|127\.0\.0\.1|\[::1\])"
 HOST_OK = re.compile(rf"^{LOCAL}(:\d{{1,5}})?$", re.I)
 ORIGIN_OK = re.compile(rf"^https?://{LOCAL}(:\d{{1,5}})?$", re.I)
+# Extra host names the engine answers to when it runs behind a reverse proxy (Easypanel, Traefik, nginx),
+# comma separated, without scheme or port. Default: none, so only localhost. Set SCRAPER_API_KEY too.
+ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("SCRAPER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+
+
+def host_allowed(host):
+    return bool(HOST_OK.match(host)) or host.lower().rsplit(":", 1)[0] in ALLOWED_HOSTS if host else False
+
+
+def origin_allowed(origin, host):
+    if ORIGIN_OK.match(origin) and origin.split("://", 1)[1].lower() == host.lower():
+        return True
+    scheme, _, rest = origin.partition("://")
+    return scheme.lower() in ("http", "https") and rest.lower().rsplit(":", 1)[0] in ALLOWED_HOSTS \
+        and rest.lower().rsplit(":", 1)[0] == host.lower().rsplit(":", 1)[0]
+
 JOB_PATH = re.compile(r"^/api/v1/jobs/([0-9a-f-]{36})(/download)?$")
 JOB_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _log_lock = threading.Lock()
@@ -731,12 +747,12 @@ class Handler(BaseHTTPRequestHandler):
     def guard(self):
         """Host (DNS rebinding) and Origin (cross-site posts) checks, plus the optional key."""
         host = self.headers.get("Host", "")
-        if not HOST_OK.match(host):
+        if not host_allowed(host):
             self.close_connection = True
             self.fail(421, "this engine answers to localhost only")
             return False
         origin = self.headers.get("Origin")  # only this page: a dev server on another local port is another site
-        if origin is not None and not (ORIGIN_OK.match(origin) and origin.split("://", 1)[1].lower() == host.lower()):
+        if origin is not None and not origin_allowed(origin, host):
             self.close_connection = True
             self.fail(403, "requests from other websites are refused")
             return False
