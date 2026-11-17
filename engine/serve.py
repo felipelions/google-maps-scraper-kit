@@ -749,7 +749,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Engine", MARK)
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")  # no-referrer makes Chrome send Origin: null on form POSTs
         self.send_header("Cache-Control", "no-store")
         for k, v in headers:
             self.send_header(k, v)
@@ -799,6 +799,8 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(421, "this engine answers to localhost only")
             return False
         origin = self.headers.get("Origin")  # only this page: a dev server on another local port is another site
+        if origin == "null" and (self.headers.get("Sec-Fetch-Site") or "").lower() == "same-origin":
+            origin = None  # the browser hid the origin of a same-site form post; Sec-Fetch-Site vouches for it
         if origin is not None and not origin_allowed(origin, host):
             self.close_connection = True
             self.fail(403, "requests from other websites are refused")
