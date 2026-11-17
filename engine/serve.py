@@ -15,7 +15,7 @@ Google Maps, for email or socials jobs to the businesses' own websites, and for 
 to Google's public DNS (dns.google), nothing else.
 Standard library only.
 """
-import argparse, csv, gzip, hmac, html, io, json, os, re, secrets, signal, socket, socketserver, sqlite3, sys, threading, unicodedata, zlib
+import argparse, csv, gzip, hmac, html, io, json, os, re, secrets, signal, socket, socketserver, sqlite3, sys, threading, time, unicodedata, zlib
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,9 +31,6 @@ for _stream in (sys.stdout, sys.stderr):  # ✓ and accented names on a Windows 
 VERSION = "2.5.1"
 MARK = f"gmskit-engine/{VERSION}"  # X-Engine header: tells scripts/engine.py this engine from others
 REPO = "https://github.com/Mahanaicoach/google-maps-scraper-kit"
-# The web UI's sponsor box: the browser reads this static file from GitHub (cached a day, no
-# tracking), so the sponsors it lists change without anyone updating their copy of the kit.
-SPONSORS = "https://raw.githubusercontent.com/Mahanaicoach/google-maps-scraper-kit/master/assets/sponsors/sponsors.json"
 # The web UI's update notice: the browser asks GitHub for the kit's latest release once a day (a
 # public JSON endpoint, nothing about the user in the request) and shows a line when it is newer
 # than this copy. Nothing updates itself: the line says to run scripts/update.sh.
@@ -42,10 +39,12 @@ RELEASES = "https://api.github.com/repos/Mahanaicoach/google-maps-scraper-kit/re
 # place that does not exist: presets/business-types.json (hand-picked; add a niche there) and
 # presets/cities.tsv.gz (GeoNames cities1000, CC BY 4.0: name, region, country code, lat, lon, biggest first).
 # What also offers Google Business Profile's category names (4,053, US English) from
-# lobstrio/google-business-categories, pinned to one commit. The browser loads that list from GitHub,
-# like the sponsor box; the kit ships no copy, because that repository has no licence file.
+# lobstrio/google-business-categories, pinned to one commit. The browser loads that list from GitHub;
+# the kit ships no copy, because that repository has no licence file.
 CATEGORIES = ("https://raw.githubusercontent.com/lobstrio/google-business-categories/"
               "4ee1c4788d07c812a32986177c2a51c28957062f/data/google-business-categories.txt")
+UI_COOKIE = "gmskit_ui"
+UI_TTL = 7 * 24 * 3600  # session cookie lifetime in seconds
 PRESETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
 
 
@@ -66,7 +65,7 @@ def load_types(folder=None):
 TYPES = load_types()
 TYPES_JS = json.dumps(TYPES).replace("</", "<\\/")  # the What list, inlined in the page script
 _cities, _cities_lock = None, threading.Lock()
-ENV_KEYS = ("SCRAPER_PORT", "SCRAPER_API_KEY", "SCRAPER_HEADLESS")
+ENV_KEYS = ("SCRAPER_PORT", "SCRAPER_API_KEY", "SCRAPER_UI_PASSWORD", "SCRAPER_HEADLESS")
 MAX_BODY = 1 << 20
 LOCAL = r"(localhost|127\.0\.0\.1|\[::1\])"
 HOST_OK = re.compile(rf"^{LOCAL}(:\d{{1,5}})?$", re.I)
@@ -86,6 +85,45 @@ def origin_allowed(origin, host):
     scheme, _, rest = origin.partition("://")
     return scheme.lower() in ("http", "https") and rest.lower().rsplit(":", 1)[0] in ALLOWED_HOSTS \
         and rest.lower().rsplit(":", 1)[0] == host.lower().rsplit(":", 1)[0]
+
+
+def ui_token(password, exp):
+    """Signed session value for the web UI login cookie."""
+    sig = hmac.new(password.encode(), f"gmskit_ui|{exp}".encode(), "sha256").hexdigest()
+    return f"{exp}.{sig}"
+
+
+def parse_cookies(header):
+    out = {}
+    for part in (header or "").split(";"):
+        k, sep, v = part.strip().partition("=")
+        if sep:
+            out[k] = v
+    return out
+
+
+def ui_session_ok(password, cookie_header):
+    """True when UI login is off, or the request carries a valid gmskit_ui cookie."""
+    if not password:
+        return True
+    raw = parse_cookies(cookie_header).get(UI_COOKIE, "")
+    exp_s, sep, sig = raw.partition(".")
+    if not sep or not exp_s.isdigit() or not sig:
+        return False
+    exp = int(exp_s)
+    if exp < int(time.time()):
+        return False
+    want = hmac.new(password.encode(), f"gmskit_ui|{exp}".encode(), "sha256").hexdigest()
+    return hmac.compare_digest(want, sig)
+
+
+def cookie_header(value, max_age, secure=False):
+    """Set-Cookie for gmskit_ui, or a clearing cookie when value is empty."""
+    parts = [f"{UI_COOKIE}={value}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={max_age}"]
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
 
 JOB_PATH = re.compile(r"^/api/v1/jobs/([0-9a-f-]{36})(/download)?$")
 JOB_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -164,8 +202,8 @@ def env_value(v):
 
 
 def read_env():
-    """SCRAPER_PORT, SCRAPER_API_KEY and SCRAPER_HEADLESS: the environment wins, then the kit's .env (last line wins,
-    as in docker compose and scripts/scrape.py)."""
+    """SCRAPER_PORT, SCRAPER_API_KEY, SCRAPER_UI_PASSWORD and SCRAPER_HEADLESS: the environment wins, then the
+    kit's .env (last line wins, as in docker compose and scripts/scrape.py)."""
     found = {}
     try:
         with open(os.path.join(browser.KIT, ".env"), encoding="utf-8-sig", errors="replace") as f:
@@ -260,220 +298,225 @@ def docs_page(nonce):
     return "".join(out)
 
 
-PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Google Maps Scraper Kit</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%230b7a5b%27 d=%27M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z%27/%3E%3C/svg%3E">
+LOGIN = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entrar — Google Maps Scraper Kit</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z%27/%3E%3C/svg%3E">
 <style nonce="{nonce}">
-:root {{ color-scheme: light dark; --paper: #f5f3ee; --sheet: #fffdf8; --ink: #17191c; --soft: #5b5f66; --rule: #dcd8ce;
-  --go: #0b7a5b; --go-ink: #fff; --ring: #2f8f73; --bad: #b42318; --tag: #8a5a00; --alt: #3d5a80; --star: #f1c21b; --heart: #ea4aaa;
-  --serif: ui-serif, "New York", Charter, "Iowan Old Style", Georgia, serif;
-  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --paper: #111312; --sheet: #181b19; --ink: #ebe8e1; --soft: #a3a69f;
-  --rule: #2c312d; --go: #46c49a; --go-ink: #0b1410; --ring: #7fdcbc; --bad: #ff8a7a; --tag: #e7b45a; --alt: #8fb3de; --star: #9a6700; --heart: #bf3989; }} }}
+:root {{ color-scheme: light dark; --bg: #fafafa; --fg: #171717; --muted: #737373; --border: #e5e5e5;
+  --card: #fff; --btn: #171717; --btn-fg: #fafafa; --bad: #dc2626; --ring: #171717;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg: #0a0a0a; --fg: #ededed; --muted: #a3a3a3; --border: #262626;
+  --card: #111; --btn: #ededed; --btn-fg: #0a0a0a; --bad: #f87171; --ring: #ededed; }} }}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); }}
-main {{ max-width: 860px; margin: 0 auto; padding: 0 20px 64px; }}
-a {{ color: inherit; text-underline-offset: 3px; }} a:hover {{ color: var(--go); }}
-.top {{ display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px;
-  padding: 28px 0 14px; border-bottom: 2px solid var(--ink); }}
-h1 {{ margin: 0; font: 600 1.6rem/1.2 var(--serif); letter-spacing: -.01em; }}
-.top nav {{ display: flex; gap: 16px; font-size: .9rem; color: var(--soft); }}
-.mono {{ font-family: var(--mono); font-size: .85em; }} .soft {{ color: var(--soft); font-size: .875rem; }}
-.update {{ margin-top: 14px; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 10px; background: var(--sheet); font-size: .9rem; }}
-.update code {{ font-size: .85rem; }}
-.stars {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding-top: 16px; color: var(--soft); font-size: .9rem; }}
-.gh {{ display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 14px; border-radius: 8px;
-  color: var(--paper); background: var(--ink); font-size: .9rem; font-weight: 600; text-decoration: none; transition: filter .15s; }}
-.gh:hover {{ color: var(--paper); filter: brightness(1.3); }} .gh .star {{ color: var(--star); }} .gh .heart {{ color: var(--heart); }}
-.sponsors {{ position: relative; margin-top: 16px; padding: 16px 16px 14px; background: var(--sheet);
-  border: 1px solid var(--rule); border-radius: 12px; }}
-.sp-close {{ position: absolute; top: 6px; right: 6px; min-height: 36px; width: 36px; padding: 0; border: 0;
-  background: transparent; color: var(--soft); font-size: 1.3rem; line-height: 1; }}
-.sp-close:hover {{ color: var(--ink); }}
-.sp-head {{ margin: 0 40px 4px 0; color: var(--soft); font-size: .85rem; }}
-.sp-ask {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 12px 0 0; padding-top: 12px;
-  border-top: 1px solid var(--rule); color: var(--soft); font-size: .9rem; }}
-.sp-grid[hidden] + .sp-ask {{ margin: 0; padding: 0 40px 0 0; border: 0; }}  /* no paid sponsor loaded: the ask alone */
-.sp-grid {{ display: grid; gap: 4px 16px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }}
-.sp {{ display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 10px; margin: 0 -10px; color: var(--ink);
-  text-decoration: none; border-radius: 10px; transition: background-color .15s; }}
-.sp:hover {{ color: var(--ink); background: var(--paper); }}
-.sp-mark {{ flex: none; display: grid; place-items: center; width: 42px; height: 42px; border-radius: 10px;
-  color: var(--sheet); background: var(--brand, var(--go)); font: 700 1.15rem/1 var(--serif); }}
-.sp:nth-child(2) .sp-mark {{ background: var(--brand, var(--ink)); }} .sp:nth-child(3) .sp-mark {{ background: var(--brand, var(--tag)); }}
-.sp:nth-child(4) .sp-mark {{ background: var(--brand, var(--alt)); }}  /* neutral per tile, never a guessed brand colour */
-.sp-body {{ display: grid; gap: 2px; min-width: 0; }} .sp-body b {{ font: 600 1.02rem/1.25 var(--serif); }}
-.sp-line {{ display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
-  color: var(--soft); font-size: .85rem; line-height: 1.4; }}
-.sp-go {{ flex: none; margin-left: auto; color: var(--soft); transition: transform .15s, color .15s; }}
-.sp:hover .sp-go {{ color: var(--go); transform: translate(2px, -2px); }}
-h2 {{ margin: 0 0 12px; font: 600 1.15rem/1.3 var(--serif); }}
-section {{ padding: 28px 0 0; }}
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  background: var(--bg); color: var(--fg); font: 15px/1.5 var(--font); -webkit-font-smoothing: antialiased; }}
+.card {{ width: min(380px, 100%); padding: 32px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }}
+h1 {{ margin: 0 0 6px; font-size: 1.25rem; font-weight: 600; letter-spacing: -.02em; }}
+.sub {{ margin: 0 0 24px; color: var(--muted); font-size: .9rem; }}
+label {{ display: grid; gap: 8px; font-size: .85rem; font-weight: 500; }}
+input {{ font: inherit; width: 100%; min-height: 42px; padding: 10px 12px; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; }}
+input:focus {{ outline: 2px solid var(--ring); outline-offset: 1px; border-color: transparent; }}
+button {{ margin-top: 16px; width: 100%; min-height: 42px; padding: 10px 16px; border: 0; border-radius: 8px;
+  background: var(--btn); color: var(--btn-fg); font: inherit; font-weight: 550; cursor: pointer; }}
+button:hover {{ filter: brightness(1.08); }}
+.err {{ margin: 12px 0 0; color: var(--bad); font-size: .875rem; min-height: 1.25em; }}
+</style></head><body>
+<form class="card" method="post" action="/login" id="f">
+  <h1>Google Maps Scraper Kit</h1>
+  <p class="sub">Digite a senha para acessar o painel.</p>
+  <label for="password">Senha
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+  </label>
+  <button type="submit">Entrar</button>
+  <p class="err" id="err" role="status">{error}</p>
+</form>
+</body></html>"""
+
+
+PAGE = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Google Maps Scraper Kit</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z%27/%3E%3C/svg%3E">
+<style nonce="{nonce}">
+:root {{ color-scheme: light dark; --bg: #fafafa; --fg: #171717; --muted: #737373; --border: #e5e5e5;
+  --card: #fff; --btn: #171717; --btn-fg: #fafafa; --soft-btn: #f5f5f5; --bad: #dc2626; --ok: #16a34a;
+  --warn: #ca8a04; --ring: #171717; --hover: #f5f5f5;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg: #0a0a0a; --fg: #ededed; --muted: #a3a3a3; --border: #262626;
+  --card: #111; --btn: #ededed; --btn-fg: #0a0a0a; --soft-btn: #1a1a1a; --bad: #f87171; --ok: #4ade80;
+  --warn: #facc15; --ring: #ededed; --hover: #1a1a1a; }} }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 var(--font); -webkit-font-smoothing: antialiased; }}
+main {{ max-width: 880px; margin: 0 auto; padding: 0 20px 72px; }}
+a {{ color: inherit; text-underline-offset: 3px; }} a:hover {{ opacity: .8; }}
+.top {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 20px;
+  padding: 24px 0; border-bottom: 1px solid var(--border); }}
+h1 {{ margin: 0; font-size: 1.15rem; font-weight: 600; letter-spacing: -.02em; }}
+.top nav {{ display: flex; align-items: center; gap: 8px 14px; font-size: .875rem; color: var(--muted); }}
+.top nav a, .top nav button.link {{ color: var(--muted); text-decoration: none; background: none; border: 0;
+  padding: 0; min-height: 0; font: inherit; cursor: pointer; }}
+.top nav a:hover, .top nav button.link:hover {{ color: var(--fg); }}
+.mono {{ font-family: var(--mono); font-size: .8em; }} .soft {{ color: var(--muted); font-size: .875rem; }}
+.update {{ margin-top: 16px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); font-size: .875rem; }}
+.update code {{ font-size: .8rem; font-family: var(--mono); }}
+h2 {{ margin: 0 0 14px; font-size: 1rem; font-weight: 600; letter-spacing: -.01em; }}
+section {{ padding: 32px 0 0; }}
 form {{ display: grid; gap: 14px; }}
-.sr {{ position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }}
 .ww {{ display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }}
 .pick {{ display: grid; gap: 6px; align-content: start; }}
-.search {{ display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: var(--sheet);
-  border: 1.5px solid var(--ink); border-radius: 14px; box-shadow: 0 1px 0 var(--rule); }}
-.search:focus-within {{ outline: 3px solid var(--ring); outline-offset: 2px; }}
-.search svg {{ flex: none; color: var(--go); }}
-.search input {{ flex: 1; padding: 0; border: 0; outline: 0; background: transparent; font-size: 1.05rem; }}
+.search {{ display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--card);
+  border: 1px solid var(--border); border-radius: 8px; }}
+.search:focus-within {{ outline: 2px solid var(--ring); outline-offset: 1px; border-color: transparent; }}
+.search svg {{ flex: none; color: var(--muted); }}
+.search input {{ flex: 1; padding: 0; border: 0; outline: 0; background: transparent; font-size: 1rem; color: var(--fg); }}
 .box {{ position: relative; }}
 .opts {{ position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 4px); max-height: 280px; overflow-y: auto;
-  margin: 0; padding: 4px; list-style: none; background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / .14); }}
+  margin: 0; padding: 4px; list-style: none; background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / .12); }}
 .opts li {{ padding: 9px 10px; border-radius: 6px; cursor: pointer; }}
-.opts li:hover, .opts li[aria-selected=true] {{ background: color-mix(in srgb, var(--go) 12%, var(--sheet)); }}
+.opts li:hover, .opts li[aria-selected=true] {{ background: var(--hover); }}
 .tags:empty {{ display: none; }}
-.tag {{ min-height: 36px; padding: 6px 12px; border-color: var(--go); border-radius: 999px;
-  background: color-mix(in srgb, var(--go) 10%, var(--sheet)); }}
-.hint {{ margin: -6px 2px 0; }}
-label {{ display: grid; gap: 6px; font-size: .9rem; font-weight: 600; }}
-input {{ font: inherit; font-weight: 400; min-height: 44px; width: 100%; padding: 9px 12px; color: var(--ink);
-  background: var(--sheet); border: 1px solid var(--rule); border-radius: 8px; }}
-input:hover {{ border-color: var(--soft); }}
-input[type=number] {{ font-family: var(--mono); font-size: .95rem; }}
-textarea {{ font: inherit; }}
+.tag {{ min-height: 32px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--soft-btn); font-size: .85rem; }}
+.hint {{ margin: -4px 2px 0; }}
+label {{ display: grid; gap: 6px; font-size: .875rem; font-weight: 500; }}
+input {{ font: inherit; font-weight: 400; min-height: 40px; width: 100%; padding: 8px 12px; color: var(--fg);
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px; }}
+input:hover {{ border-color: var(--muted); }}
+input:focus {{ outline: 2px solid var(--ring); outline-offset: 1px; border-color: transparent; }}
+input[type=number] {{ font-family: var(--mono); font-size: .9rem; }}
 .collect {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; border: 0; }}
-.collect legend {{ float: left; margin-right: 6px; padding: 12px 0; font-size: .9rem; color: var(--soft); }}
-.chip {{ display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 8px 14px; font-weight: 500;
-  border: 1px solid var(--rule); border-radius: 999px; background: var(--sheet); cursor: pointer; transition: border-color .15s, background-color .15s; }}
-.chip:hover {{ border-color: var(--soft); }}
-.chip:has(input:checked) {{ border-color: var(--go); background: color-mix(in srgb, var(--go) 10%, var(--sheet)); }}
-.chip input {{ width: 18px; height: 18px; min-height: 0; margin: 0; accent-color: var(--go); cursor: pointer; }}
-details {{ border-top: 1px solid var(--rule); }} details:last-of-type {{ border-bottom: 1px solid var(--rule); }}
+.collect legend {{ float: left; margin-right: 8px; padding: 10px 0; font-size: .875rem; color: var(--muted); }}
+.chip {{ display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 12px; font-weight: 450;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--card); cursor: pointer; }}
+.chip:hover {{ border-color: var(--muted); }}
+.chip:has(input:checked) {{ border-color: var(--fg); background: var(--soft-btn); }}
+.chip input {{ width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--fg); cursor: pointer; }}
+details {{ border-top: 1px solid var(--border); }} details:last-of-type {{ border-bottom: 1px solid var(--border); }}
 summary {{ list-style: none; display: flex; align-items: center; justify-content: space-between; min-height: 48px;
-  font-weight: 600; cursor: pointer; }}
+  font-weight: 550; cursor: pointer; }}
 summary::-webkit-details-marker {{ display: none; }}
-summary::after {{ content: "+"; font: 400 1.4rem/1 var(--mono); color: var(--soft); }}
+summary::after {{ content: "+"; font: 400 1.25rem/1 var(--mono); color: var(--muted); }}
 details[open] summary::after {{ content: "\\2212"; }}
-summary:hover {{ color: var(--go); }}
 .body {{ display: grid; gap: 12px; align-items: start; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); padding: 2px 0 18px; }}
 .body .soft {{ font-weight: 400; }} .wide {{ grid-column: 1 / -1; }}
-.body .chip {{ border-radius: 10px; font-weight: 400; }}
-.body textarea {{ min-height: 84px; padding: 9px 12px; color: var(--ink); background: var(--sheet); border: 1px solid var(--rule);
-  border-radius: 8px; font: .9rem/1.5 var(--mono); resize: vertical; }}
+.body .chip {{ font-weight: 400; }}
+.body textarea {{ min-height: 84px; padding: 9px 12px; color: var(--fg); background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; font: .875rem/1.5 var(--mono); resize: vertical; }}
 .go {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding-top: 4px; }}
-button {{ font: inherit; min-height: 40px; padding: 8px 14px; color: var(--ink); background: var(--sheet);
-  border: 1px solid var(--rule); border-radius: 8px; cursor: pointer; transition: border-color .15s, filter .15s; }}
-button:hover {{ border-color: var(--ink); }}
+button {{ font: inherit; min-height: 36px; padding: 7px 12px; color: var(--fg); background: var(--card);
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }}
+button:hover {{ background: var(--hover); }}
 .collect-choice {{ display: flex; align-items: center; gap: 6px; }}
-button.info-button {{ width: 40px; min-height: 40px; padding: 0; border-radius: 50%; font-weight: 700;
-  color: var(--soft); }}
-.info-note[popover] {{ width: min(360px, calc(100vw - 40px)); padding: 20px; border: 1px solid var(--rule);
-  border-radius: 12px; background: var(--sheet); color: var(--ink); line-height: 1.6;
+button.info-button {{ width: 36px; min-height: 36px; padding: 0; border-radius: 50%; font-weight: 650; color: var(--muted); }}
+.info-note[popover] {{ width: min(360px, calc(100vw - 40px)); padding: 18px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--card); color: var(--fg); line-height: 1.55;
   box-shadow: 0 12px 40px #0003; }}
 .info-note p {{ margin: 8px 0 0; }}
-
-button.primary {{ min-height: 48px; padding: 10px 26px; color: var(--go-ink); background: var(--go); border-color: var(--go);
-  font-weight: 650; letter-spacing: .01em; }}
-button.primary:hover {{ filter: brightness(1.08); }} button:disabled {{ opacity: .6; cursor: progress; }}
-:focus-visible {{ outline: 3px solid var(--ring); outline-offset: 2px; }}
-#msg {{ margin: 0; min-height: 1.5em; font-size: .95rem; }} #msg.ok {{ color: var(--go); }} #msg.bad {{ color: var(--bad); }}
+button.primary {{ min-height: 42px; padding: 10px 20px; color: var(--btn-fg); background: var(--btn); border-color: var(--btn);
+  font-weight: 550; letter-spacing: -.01em; }}
+button.primary:hover {{ filter: brightness(1.08); background: var(--btn); }}
+button:disabled {{ opacity: .55; cursor: progress; }}
+:focus-visible {{ outline: 2px solid var(--ring); outline-offset: 2px; }}
+#msg {{ margin: 0; min-height: 1.4em; font-size: .9rem; }} #msg.ok {{ color: var(--ok); }} #msg.bad {{ color: var(--bad); }}
 table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ padding: 12px 8px 12px 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--rule); }}
-th {{ padding-top: 0; color: var(--soft); font: 600 .7rem/1.4 var(--mono); letter-spacing: .1em; text-transform: uppercase;
-  border-bottom: 1.5px solid var(--ink); }}
-td.when {{ font-family: var(--mono); font-size: .85rem; color: var(--soft); white-space: nowrap; }}
-.state {{ display: flex; align-items: center; gap: 8px; font-weight: 600; }}
-.state::before {{ content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--soft); }}
-.state.ok::before {{ background: var(--go); }} .state.failed {{ color: var(--bad); }} .state.failed::before {{ background: var(--bad); }}
-.state.working::before {{ background: var(--tag); }}
-.count {{ font-family: var(--mono); font-size: .85rem; font-weight: 400; color: var(--soft); }}
-progress {{ display: block; width: 100%; max-width: 200px; height: 6px; margin-top: 8px; accent-color: var(--go); }}
-.note {{ margin-top: 4px; color: var(--soft); font-size: .85rem; }}
+th, td {{ padding: 12px 8px 12px 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }}
+th {{ padding-top: 0; color: var(--muted); font: 550 .7rem/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }}
+td.when {{ font-family: var(--mono); font-size: .8rem; color: var(--muted); white-space: nowrap; }}
+.state {{ display: flex; align-items: center; gap: 8px; font-weight: 550; }}
+.state::before {{ content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }}
+.state.ok::before {{ background: var(--ok); }} .state.failed {{ color: var(--bad); }} .state.failed::before {{ background: var(--bad); }}
+.state.working::before {{ background: var(--warn); }}
+.count {{ font-family: var(--mono); font-size: .8rem; font-weight: 400; color: var(--muted); }}
+progress {{ display: block; width: 100%; max-width: 200px; height: 4px; margin-top: 8px; accent-color: var(--fg); }}
+.note {{ margin-top: 4px; color: var(--muted); font-size: .8rem; }}
 .row {{ display: flex; flex-wrap: wrap; gap: 6px; }} .scroll {{ overflow-x: auto; }} [hidden] {{ display: none !important; }}
-@media (max-width: 560px) {{ h1 {{ font-size: 1.35rem; }} button.primary {{ width: 100%; }}
-  thead {{ display: none; }} tr, td {{ display: block; }} tr {{ padding: 12px 0; border-bottom: 1px solid var(--rule); }}
-  td {{ padding: 2px 0; border: 0; }} td.when {{ font-size: .8rem; }} td .row {{ margin-top: 8px; }} }}
+@media (max-width: 560px) {{ button.primary {{ width: 100%; }}
+  thead {{ display: none; }} tr, td {{ display: block; }} tr {{ padding: 12px 0; border-bottom: 1px solid var(--border); }}
+  td {{ padding: 2px 0; border: 0; }} td.when {{ font-size: .75rem; }} td .row {{ margin-top: 8px; }} }}
 @media (prefers-reduced-motion: reduce) {{ * {{ transition: none !important; }} }}
 </style></head><body><main>
 <header class="top"><h1>Google Maps Scraper Kit</h1>
-<nav><span class="mono">v{version}</span><a href="/api/docs">API docs</a></nav></header>
-<div class="update" id="update" role="status" hidden><b>Kit v<span id="up-v"></span> is out</b> (this copy is v{version}).
-  <a id="up-link" href="{repo}/releases/latest" target="_blank" rel="noopener">What changed</a> &middot;
-  update with <code>bash scripts/update.sh</code>, or <code>docker compose up -d --build</code> in Docker.</div>
-<div class="stars"><a class="gh" href="{repo}" target="_blank" rel="noopener"><span class="star"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.5l2.9 6 6.6.8-4.9 4.6 1.3 6.6L12 17.2l-5.9 3.3 1.3-6.6L2.5 9.3l6.6-.8z"/></svg></span>Star on GitHub</a>
-  <span>Useful? A star helps other people find this free kit.</span></div>
-<aside class="sponsors" id="sponsors" aria-label="Sponsors"><button type="button" class="sp-close" id="sp-close"
-  aria-label="Hide sponsors">&times;</button>
-  <div class="sp-head" id="sp-head" hidden>Supported by</div><div class="sp-grid" id="sp-grid" hidden></div>
-  <p class="sp-ask"><span>Support the upkeep of this free, open-source kit.</span>
-    <a class="gh" href="https://github.com/sponsors/Mahanaicoach" target="_blank" rel="noopener"><span class="heart"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 21s-7.5-4.6-9.6-9.2C1 8.6 2.9 5 6.6 5c2.1 0 3.5 1.2 5.4 3.2C13.9 6.2 15.3 5 17.4 5 21.1 5 23 8.6 21.6 11.8 19.5 16.4 12 21 12 21z"/></svg></span>Sponsor on GitHub</a></p>
-</aside>
-<section aria-labelledby="h-new"><h2 id="h-new">New search</h2>
+<nav><span class="mono">v{version}</span><a href="/api/docs">API</a>
+<form method="post" action="/logout" style="display:inline;margin:0">{logout}</form></nav></header>
+<div class="update" id="update" role="status" hidden><b>Kit v<span id="up-v"></span> disponível</b> (esta cópia é v{version}).
+  <a id="up-link" href="{repo}/releases/latest" target="_blank" rel="noopener">O que mudou</a> &middot;
+  atualize com <code>bash scripts/update.sh</code>, ou <code>docker compose up -d --build</code> no Docker.</div>
+<section aria-labelledby="h-new"><h2 id="h-new">Nova busca</h2>
 <form id="f">
   <div class="ww">
-    <div class="pick"><label for="what">What</label><div class="box">
-      <div class="search"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+    <div class="pick"><label for="what">O quê</label><div class="box">
+      <div class="search"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
         <input id="what" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="what-opts"
-          autocomplete="off" placeholder="e.g. Dentists"></div>
-      <ul class="opts" id="what-opts" role="listbox" aria-label="Business types" hidden></ul></div>
+          autocomplete="off" placeholder="ex.: Dentistas"></div>
+      <ul class="opts" id="what-opts" role="listbox" aria-label="Tipos de negócio" hidden></ul></div>
       <div class="row tags" id="whats"></div></div>
-    <div class="pick"><label for="where">Where</label><div class="box">
-      <div class="search"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+    <div class="pick"><label for="where">Onde</label><div class="box">
+      <div class="search"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"/>
         <circle cx="12" cy="9.5" r="2.5"/></svg>
         <input id="where" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="where-opts"
-          autocomplete="off" placeholder="e.g. Austin"></div>
-      <ul class="opts" id="where-opts" role="listbox" aria-label="Cities" hidden></ul></div>
+          autocomplete="off" placeholder="ex.: São Paulo"></div>
+      <ul class="opts" id="where-opts" role="listbox" aria-label="Cidades" hidden></ul></div>
       <div class="row tags" id="wheres"></div></div>
   </div>
-  <p class="hint soft">Pick from the lists; add as many as you like. Each business type is searched in each city, one job per city.</p>
-  <fieldset class="collect"><legend>Collect</legend>
-    <label class="chip"><input type="checkbox" id="email" checked> Emails</label>
+  <p class="hint soft">Escolha nas listas; adicione quantos quiser. Cada tipo de negócio é buscado em cada cidade, um job por cidade.</p>
+  <fieldset class="collect"><legend>Coletar</legend>
+    <label class="chip"><input type="checkbox" id="email" checked> E-mails</label>
     <div class="collect-choice">
-      <label class="chip"><input type="checkbox" id="socials" checked> Social accounts</label>
+      <label class="chip"><input type="checkbox" id="socials" checked> Contas sociais</label>
       <button type="button" class="info-button" popovertarget="socials-help"
-        aria-label="About social accounts and scrape speed"
-        title="Finds social profile links on business websites. Website checks may slow the scrape."><span aria-hidden="true">!</span></button>
+        aria-label="Sobre contas sociais e velocidade"
+        title="Encontra links de perfis sociais nos sites. Isso pode deixar a busca mais lenta."><span aria-hidden="true">!</span></button>
     </div>
     <div class="collect-choice">
-      <label class="chip"><input type="checkbox" id="browser-sites"> Render websites (Playwright)</label>
+      <label class="chip"><input type="checkbox" id="browser-sites"> Renderizar sites (Playwright)</label>
       <button type="button" class="info-button" popovertarget="browser-help"
-        aria-label="About website rendering and scrape speed"
-        title="Retries websites with a browser. This can slow the scrape; enable only when needed."><span aria-hidden="true">!</span></button>
+        aria-label="Sobre renderização de sites e velocidade"
+        title="Tenta de novo com um navegador. Pode deixar a busca mais lenta; use só se precisar."><span aria-hidden="true">!</span></button>
     </div>
-    <div id="socials-help" class="info-note" popover role="note" aria-label="Social account collection">
-      <strong>Social accounts</strong>
-      <p>Finds Instagram, Facebook, LinkedIn, TikTok, YouTube and X profile links on each business website.</p>
-      <p>Website checks may slow the scrape compared with collecting Maps listings alone. Pages already fetched for emails are reused.</p>
-      <p>Turn this option off when you do not need social accounts.</p>
+    <div id="socials-help" class="info-note" popover role="note" aria-label="Coleta de contas sociais">
+      <strong>Contas sociais</strong>
+      <p>Encontra links de Instagram, Facebook, LinkedIn, TikTok, YouTube e X no site de cada empresa.</p>
+      <p>Checar sites pode deixar a busca mais lenta do que coletar só as listagens do Maps. Páginas já baixadas para e-mails são reaproveitadas.</p>
+      <p>Desative se não precisar de contas sociais.</p>
     </div>
-    <div id="browser-help" class="info-note" popover role="note" aria-label="Website rendering speed">
-      <strong>Render websites</strong>
-      <p>Retries websites when the quick website check finds no email addresses or social profile links.</p>
-      <p>This can slow the scrape. Browser retries share a 30-second budget per job, plus cleanup time. Leave this off for the fastest run.</p>
+    <div id="browser-help" class="info-note" popover role="note" aria-label="Renderização de sites">
+      <strong>Renderizar sites</strong>
+      <p>Tenta de novo com um navegador quando a checagem rápida não acha e-mails ou redes sociais.</p>
+      <p>Pode deixar a busca mais lenta. As tentativas compartilham um orçamento de 30 segundos por job, mais a limpeza. Deixe desligado para a execução mais rápida.</p>
     </div>
   </fieldset>
-  <details><summary>Location and language</summary><div class="body">
-    <p class="wide soft">Each job centres the map on its city.</p>
+  <details><summary>Localização e idioma</summary><div class="body">
+    <p class="wide soft">Cada job centraliza o mapa na cidade escolhida.</p>
     <label for="zoom">Zoom<input id="zoom" type="number" min="1" max="21" value="15"></label>
-    <label for="lang">Language<input id="lang" value="en" maxlength="2" pattern="[A-Za-z]{{2}}"></label>
-    <label for="country"><span>Country <span class="soft">optional</span></span><input id="country" maxlength="2" pattern="[A-Za-z]{{2}}" placeholder="the city's"></label>
+    <label for="lang">Idioma<input id="lang" value="pt" maxlength="2" pattern="[A-Za-z]{{2}}"></label>
+    <label for="country"><span>País <span class="soft">opcional</span></span><input id="country" maxlength="2" pattern="[A-Za-z]{{2}}" placeholder="da cidade"></label>
   </div></details>
-  <details><summary>Advanced options</summary><div class="body">
-    <label for="depth">Depth<input id="depth" type="number" min="1" max="1000" value="5">
-      <span class="soft">About 20 places each.</span></label>
-    <label for="max_time">Time limit, seconds<input id="max_time" type="number" min="1" max="86400" value="600"></label>
-    <label for="reviews">Reviews per place<input id="reviews" type="number" min="0" max="5" value="0">
-      <span class="soft">0 to 5; about 2-4 s more per place.</span></label>
-    <label class="chip wide"><input type="checkbox" id="verify"> Check each email's domain (MX record) and drop the ones that do not exist</label>
+  <details><summary>Opções avançadas</summary><div class="body">
+    <label for="depth">Profundidade<input id="depth" type="number" min="1" max="1000" value="5">
+      <span class="soft">Cerca de 20 lugares cada.</span></label>
+    <label for="max_time">Limite de tempo (segundos)<input id="max_time" type="number" min="1" max="86400" value="600"></label>
+    <label for="reviews">Avaliações por lugar<input id="reviews" type="number" min="0" max="5" value="0">
+      <span class="soft">0 a 5; cerca de 2–4 s a mais por lugar.</span></label>
+    <label class="chip wide"><input type="checkbox" id="verify"> Verificar o domínio de cada e-mail (registro MX) e descartar os que não existem</label>
   </div></details>
   <details><summary>Proxies</summary><div class="body">
-    <label class="wide" for="proxies">One per line
-      <textarea id="proxies" rows="3" autocomplete="off" placeholder="e.g. http://user:pass@proxy.example.com:8000"></textarea>
-      <span class="soft">http:// or https://, with or without user:pass; socks5:// without a login. Searches take turns,
-      and one Google refuses goes through the next. Passwords show as ***.</span></label>
+    <label class="wide" for="proxies">Um por linha
+      <textarea id="proxies" rows="3" autocomplete="off" placeholder="ex.: http://user:pass@proxy.example.com:8000"></textarea>
+      <span class="soft">http:// ou https://, com ou sem user:pass; socks5:// sem login. As buscas se revezam,
+      e se o Google recusar, passa para o próximo. Senhas aparecem como ***.</span></label>
   </div></details>
-  <div class="go"><button class="primary" id="go">Start scraping</button><p id="msg" role="status" aria-live="polite"></p></div>
-  <label id="keybox" for="key" hidden>API key (SCRAPER_API_KEY)<input id="key" type="password" autocomplete="off"></label>
+  <div class="go"><button class="primary" id="go">Iniciar scraping</button><p id="msg" role="status" aria-live="polite"></p></div>
+  <label id="keybox" for="key" hidden>Chave da API (SCRAPER_API_KEY)<input id="key" type="password" autocomplete="off"></label>
 </form></section>
 <section aria-labelledby="h-jobs"><h2 id="h-jobs">Jobs</h2>
-<div class="scroll"><table><thead><tr><th>Search</th><th>Created</th><th>Status</th><th>Results</th></tr></thead>
+<div class="scroll"><table><thead><tr><th>Busca</th><th>Criado</th><th>Status</th><th>Resultados</th></tr></thead>
 <tbody id="jobs"></tbody></table></div></section>
 </main>
 <script nonce="{nonce}">
@@ -484,7 +527,7 @@ $('key').addEventListener('change', () => {{ key = $('key').value; try {{ localS
 function api(method, path, body) {{
   const h = {{}}; if (key) h['X-API-Key'] = key; if (body) h['Content-Type'] = 'application/json';
   return fetch(path, {{method, headers: h, body: body ? JSON.stringify(body) : undefined}}).then(r => {{
-    if (r.status === 401) {{ $('keybox').hidden = false; throw new Error('This engine needs its API key: enter it below.'); }}
+    if (r.status === 401) {{ $('keybox').hidden = false; throw new Error('Este engine exige a chave da API: digite-a abaixo.'); }}
     return r;
   }});
 }}
@@ -493,28 +536,28 @@ function cell(tr, text, cls) {{ const td = document.createElement('td'); td.text
 function button(td, label, fn) {{ const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.addEventListener('click', fn); td.appendChild(b); }}
 async function download(j, fmt) {{
   const r = await api('GET', '/api/v1/jobs/' + j.ID + '/download' + (fmt === 'csv' ? '' : '?format=' + fmt));
-  if (!r.ok) return say('No results yet for this job.', 'bad');
+  if (!r.ok) return say('Ainda não há resultados para este job.', 'bad');
   const a = document.createElement('a'); a.href = URL.createObjectURL(await r.blob());
   a.download = fileName(j) + (fmt === 'leads' ? '-leads.csv' : '.' + fmt); document.body.appendChild(a); a.click(); a.remove();
 }}
-function fileName(j) {{  // "bakery-in-portland-or-c063a815": after the search, plus the job id's start
+function fileName(j) {{
   const s = (j.Name || '').normalize('NFKD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   return (s || 'results') + '-' + j.ID.slice(0, 8);
 }}
-const LABEL = {{pending: 'waiting', working: 'working', ok: 'done', failed: 'failed'}};
+const LABEL = {{pending: 'aguardando', working: 'em andamento', ok: 'concluído', failed: 'falhou'}};
 function progress(j) {{
   const p = j.Progress || {{}}, name = LABEL[j.Status] || j.Status;
-  if (j.Status === 'pending') return p.keywords_done ? name + ' (resumes at keyword ' + (p.keywords_done + 1) + ')' : name;
-  if (j.Status !== 'working') return name + (p.places ? ' · ' + p.places + ' places' : '');
-  const stage = {{search: 'keyword ' + Math.min(p.keywords_done + 1, p.keywords_total) + ' of ' + p.keywords_total,
-    reviews: 'reading reviews' + (p.reviews_total ? ' ' + p.reviews_done + ' of ' + p.reviews_total : ''),
-    websites: 'checking websites'}}[p.stage] || p.stage || '';
-  return name + ' · ' + stage + ' · ' + (p.places || 0) + ' places';
+  if (j.Status === 'pending') return p.keywords_done ? name + ' (retoma na palavra ' + (p.keywords_done + 1) + ')' : name;
+  if (j.Status !== 'working') return name + (p.places ? ' · ' + p.places + ' lugares' : '');
+  const stage = {{search: 'palavra ' + Math.min(p.keywords_done + 1, p.keywords_total) + ' de ' + p.keywords_total,
+    reviews: 'lendo avaliações' + (p.reviews_total ? ' ' + p.reviews_done + ' de ' + p.reviews_total : ''),
+    websites: 'checando sites'}}[p.stage] || p.stage || '';
+  return name + ' · ' + stage + ' · ' + (p.places || 0) + ' lugares';
 }}
 async function remove(j) {{
-  if (!confirm('Delete this job and its results?')) return;
-  const r = await api('DELETE', '/api/v1/jobs/' + j.ID); say(r.ok ? 'Deleted.' : 'Could not delete it.', r.ok ? 'ok' : 'bad'); load();
+  if (!confirm('Excluir este job e os resultados?')) return;
+  const r = await api('DELETE', '/api/v1/jobs/' + j.ID); say(r.ok ? 'Excluído.' : 'Não foi possível excluir.', r.ok ? 'ok' : 'bad'); load();
 }}
 async function load() {{
   try {{
@@ -523,37 +566,37 @@ async function load() {{
     for (const j of list) {{
       const tr = document.createElement('tr');
       const name = cell(tr, j.Name); if (j.Error) {{ const s = document.createElement('div'); s.className = 'note'; s.textContent = j.Error; name.appendChild(s); }}
-      const when = new Date(j.Date);  // shown in this computer's time zone
-      cell(tr, isNaN(when) ? j.Date : when.toLocaleString([], {{dateStyle: 'medium', timeStyle: 'short'}}), 'when');
+      const when = new Date(j.Date);
+      cell(tr, isNaN(when) ? j.Date : when.toLocaleString('pt-BR', {{dateStyle: 'medium', timeStyle: 'short'}}), 'when');
       const st = cell(tr, ''), s = document.createElement('div');
       const [word, ...more] = progress(j).split(' · ');
       s.className = 'state ' + j.Status; s.textContent = word; st.appendChild(s);
       if (more.length) {{ const c = document.createElement('div'); c.className = 'count'; c.textContent = more.join(' · '); st.appendChild(c); }}
       if (j.Status === 'working') {{
         const bar = document.createElement('progress'); bar.max = 100; bar.value = (j.Progress || {{}}).percent || 0;
-        bar.setAttribute('aria-label', 'Progress of ' + j.Name); st.appendChild(bar);
+        bar.setAttribute('aria-label', 'Progresso de ' + j.Name); st.appendChild(bar);
       }}
       const act = cell(tr, ''), row = document.createElement('div'); row.className = 'row'; act.appendChild(row);
       if (j.Status !== 'pending' || (j.Progress || {{}}).places) {{
-        button(row, 'Leads CSV', () => download(j, 'leads')); button(row, 'Full CSV', () => download(j, 'csv')); button(row, 'JSON', () => download(j, 'json'));
+        button(row, 'CSV leads', () => download(j, 'leads')); button(row, 'CSV completo', () => download(j, 'csv')); button(row, 'JSON', () => download(j, 'json'));
       }}
-      button(row, 'Delete', () => remove(j));
+      button(row, 'Excluir', () => remove(j));
       tb.appendChild(tr);
     }}
-    if (!list.length) {{ const tr = document.createElement('tr'); cell(tr, 'No jobs yet. Start a search above.', 'soft').colSpan = 4; tb.appendChild(tr); }}
+    if (!list.length) {{ const tr = document.createElement('tr'); cell(tr, 'Nenhum job ainda. Inicie uma busca acima.', 'soft').colSpan = 4; tb.appendChild(tr); }}
   }} catch (e) {{ say(e.message, 'bad'); }}
 }}
 const TYPES = {types};
-const whats = [], wheres = [];  // picked business types, picked cities {{label, lat, lon, country}}
-function tags(box, list) {{  // each pick is a button; pressing it removes the pick
+const whats = [], wheres = [];
+function tags(box, list) {{
   box.replaceChildren();
   list.forEach((v, i) => {{
     const b = document.createElement('button'), text = v.label || v; b.type = 'button'; b.className = 'tag';
-    b.textContent = text + ' ×'; b.setAttribute('aria-label', 'Remove ' + text);
+    b.textContent = text + ' ×'; b.setAttribute('aria-label', 'Remover ' + text);
     b.addEventListener('click', () => {{ list.splice(i, 1); tags(box, list); }}); box.appendChild(b);
   }});
 }}
-function combo(input, box, source, choose) {{  // a box that takes only picks from its own list: arrows move, Enter or a click picks
+function combo(input, box, source, choose) {{
   let items = [], active = -1, stale = false;
   function show(list) {{
     items = list; active = list.length ? 0 : -1; stale = false; box.replaceChildren();
@@ -569,7 +612,7 @@ function combo(input, box, source, choose) {{  // a box that takes only picks fr
     input.setAttribute('aria-activedescendant', box.id + '-' + active); box.children[active].scrollIntoView({{block: 'nearest'}});
   }}
   function pick(i) {{ choose(items[i]); input.value = ''; say('', ''); source('', show); }}
-  input.addEventListener('input', () => {{  // the list shown belongs to the old text until the source answers
+  input.addEventListener('input', () => {{
     items = []; active = -1; stale = true; mark(); if ($('msg').className === 'bad') say('', ''); source(input.value.trim(), show); }});
   input.addEventListener('focus', () => source(input.value.trim(), show));
   input.addEventListener('blur', () => show([]));
@@ -577,21 +620,21 @@ function combo(input, box, source, choose) {{  // a box that takes only picks fr
     if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {{
       ev.preventDefault(); if (!items.length) return;
       active = (active + (ev.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length; mark();
-    }} else if (ev.key === 'Enter') {{  // never submits the form
+    }} else if (ev.key === 'Enter') {{
       ev.preventDefault();
       if (active >= 0) pick(active);
-      else if (input.value.trim() && !stale) say('"' + input.value.trim() + '" is not in the list. Type a few letters, then pick from it.', 'bad');
+      else if (input.value.trim() && !stale) say('"' + input.value.trim() + '" não está na lista. Digite algumas letras e escolha.', 'bad');
     }} else if (ev.key === 'Escape') show([]);
   }});
 }}
-combo($('what'), $('what-opts'), (q, show) => {{  // names that start with q first, then the rest; 50 at most
+combo($('what'), $('what-opts'), (q, show) => {{
   q = q.toLowerCase();
   const hit = TYPES.filter(t => t.toLowerCase().includes(q)), first = hit.filter(t => t.toLowerCase().startsWith(q));
   show(first.concat(hit.filter(t => !first.includes(t))).slice(0, 50).map(t => ({{label: t}})));
 }}, t => {{ if (!whats.includes(t.label)) whats.push(t.label); tags($('whats'), whats); }});
-(function () {{  // What also offers Google's own category names, cached for 30 days, as text only
+(function () {{
   const key = 'gmskit-categories', month = 30 * 86400000, base = s => s.toLowerCase().replace(/s$/, '');
-  function add(names) {{  // after the kit's own list; "Dentist" is dropped when "Dentists" is there
+  function add(names) {{
     const have = new Set(TYPES.map(base));
     for (const n of names) if (!have.has(base(n))) {{ have.add(base(n)); TYPES.push(n); }}
   }}
@@ -607,27 +650,27 @@ combo($('what'), $('what-opts'), (q, show) => {{  // names that start with q fir
   }}).catch(() => {{}});
 }})();
 let timer = 0;
-combo($('where'), $('where-opts'), (q, show) => {{  // the biggest cities that start with q; nothing typed, the biggest US ones
+combo($('where'), $('where-opts'), (q, show) => {{
   clearTimeout(timer);
   timer = setTimeout(async () => {{
     try {{
       const r = await api('GET', '/api/v1/cities?q=' + encodeURIComponent(q)); if (!r.ok) return;
       const found = await r.json();
-      if (q === $('where').value.trim() && document.activeElement === $('where')) show(found);  // else a newer lookup is coming
+      if (q === $('where').value.trim() && document.activeElement === $('where')) show(found);
     }} catch (e) {{ say(e.message, 'bad'); }}
   }}, 120);
 }}, c => {{ if (!wheres.some(w => w.label === c.label)) wheres.push(c); tags($('wheres'), wheres); }});
 $('f').addEventListener('submit', async ev => {{
   ev.preventDefault();
   for (const box of [$('what'), $('where')]) if (box.value.trim()) {{ box.focus();
-    return say('"' + box.value.trim() + '" is not picked yet. Pick it from the list, or clear the box.', 'bad'); }}
+    return say('"' + box.value.trim() + '" ainda não foi escolhido. Escolha na lista ou limpe o campo.', 'bad'); }}
   if (!whats.length || !wheres.length) {{ (whats.length ? $('where') : $('what')).focus();
-    return say('Pick at least one business type and one city from the lists.', 'bad'); }}
+    return say('Escolha pelo menos um tipo de negócio e uma cidade nas listas.', 'bad'); }}
   const proxies = $('proxies').value.split('\\n').map(s => s.trim()).filter(Boolean);
-  const go = $('go'); go.disabled = true; go.textContent = 'Starting…';
+  const go = $('go'); go.disabled = true; go.textContent = 'Iniciando…';
   let started = 0;
   try {{
-    for (const c of wheres) {{  // one job per city, its map centred on that city
+    for (const c of wheres) {{
       const keywords = whats.map(w => w + ' in ' + c.label);
       const body = {{name: Array.from(keywords[0] + (keywords.length > 1 ? ' +' + (keywords.length - 1) + ' more' : '')).slice(0, 200).join(''),
         keywords, lang: $('lang').value.trim().toLowerCase(), country: $('country').value.trim().toLowerCase() || c.country.toLowerCase(),
@@ -636,21 +679,21 @@ $('f').addEventListener('submit', async ev => {{
         reviews_max: +$('reviews').value || 0}};
       if (proxies.length) body.proxies = proxies;
       const r = await api('POST', '/api/v1/jobs', body), d = await r.json();
-      if (!r.ok) return say('Not started' + (started ? ' after ' + started + ' job(s)' : '') + ': ' + d.message, 'bad');
+      if (!r.ok) return say('Não iniciado' + (started ? ' após ' + started + ' job(s)' : '') + ': ' + d.message, 'bad');
       started++;
     }}
-    say(started === 1 ? 'Started. It runs in the background, and the list below updates by itself.'
-      : 'Started ' + started + ' jobs, one per city. They run one after another, and the list below updates by itself.', 'ok');
+    say(started === 1 ? 'Iniciado. Roda em segundo plano e a lista abaixo atualiza sozinha.'
+      : 'Iniciados ' + started + ' jobs, um por cidade. Rodam um após o outro e a lista abaixo atualiza sozinha.', 'ok');
   }} catch (e) {{ say(e.message, 'bad'); }}
-  finally {{ go.disabled = false; go.textContent = 'Start scraping'; load(); }}
+  finally {{ go.disabled = false; go.textContent = 'Iniciar scraping'; load(); }}
 }});
 load(); setInterval(load, 3000);
-(function () {{  // update notice: GitHub's latest release once a day, shown only when it is newer than this copy
+(function () {{
   const key = 'gmskit-update', day = 86400000, mine = '{version}';
   const num = v => (String(v).replace(/^v/, '').split('.').slice(0, 3).map(x => parseInt(x, 10) || 0));
   const newer = (a, b) => {{ const x = num(a), y = num(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return false; }};
   function show(tag) {{
-    if (!/^v?\d+\.\d+\.\d+/.test(tag || '') || !newer(tag, mine)) return;
+    if (!/^v?\\d+\\.\\d+\\.\\d+/.test(tag || '') || !newer(tag, mine)) return;
     $('up-v').textContent = String(tag).replace(/^v/, '').slice(0, 20);
     $('up-link').href = '{repo}/releases/tag/' + encodeURIComponent(tag);
     $('update').hidden = false;
@@ -666,49 +709,7 @@ load(); setInterval(load, 3000);
       try {{ localStorage.setItem(key, JSON.stringify({{t: Date.now(), tag: d.tag_name}})); }} catch (e) {{}}
     }}).catch(() => {{}});
 }})();
-(function () {{  // sponsor tiles: only the entries Mahan marks "ui": true in sponsors.json, as text, https links only
-  const box = $('sponsors'), grid = $('sp-grid'), key = 'gmskit-sponsors', day = 86400000;
-  $('sp-close').addEventListener('click', () => {{ box.hidden = true; }});  // as gosom: hidden until the page reloads
-  const svg = (tag, attrs) => {{ const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }};
-  function render(list) {{
-    const shown = Array.isArray(list) ? list.filter(s => s && s.ui === true && typeof s.name === 'string' && s.name.trim()
-      && typeof s.url === 'string' && s.url.startsWith('https://')).slice(0, 4) : [];
-    if (!shown.length) return;
-    grid.replaceChildren();
-    for (const s of shown) {{
-      const a = document.createElement('a'), mark = document.createElement('span'), body = document.createElement('span');
-      a.className = 'sp'; a.href = s.url; a.target = '_blank'; a.rel = 'noopener noreferrer sponsored';
-      mark.className = 'sp-mark'; mark.setAttribute('aria-hidden', 'true'); mark.textContent = s.name.trim()[0].toUpperCase();
-      if (/^#[0-9a-f]{{6}}$/i.test(s.color || '')) {{  // the sponsor's own colour, with ink or white for contrast
-        const n = parseInt(s.color.slice(1), 16), lum = (0.299 * (n >> 16) + 0.587 * (n >> 8 & 255) + 0.114 * (n & 255)) / 255;
-        mark.style.setProperty('--brand', s.color); mark.style.color = lum > .6 ? '#17191c' : '#fff';
-      }}
-      const b = document.createElement('b'); b.textContent = s.name.slice(0, 40);
-      body.className = 'sp-body'; body.appendChild(b);
-      if (typeof s.tagline === 'string' && s.tagline.trim()) {{
-        const t = s.tagline.trim().slice(0, 120), line = document.createElement('span');
-        line.className = 'sp-line'; line.textContent = t[0].toUpperCase() + t.slice(1); body.appendChild(line);
-      }}
-      const go = svg('svg', {{width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
-        'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', class: 'sp-go', 'aria-hidden': 'true'}});
-      go.appendChild(svg('path', {{d: 'M7 17L17 7M8 7h9v9'}}));
-      a.append(mark, body, go); grid.appendChild(a);
-    }}
-    grid.hidden = $('sp-head').hidden = false;
-  }}
-  try {{
-    const c = JSON.parse(localStorage.getItem(key) || 'null');
-    if (c && Date.now() - c.t < day) return render(c.list);
-  }} catch (e) {{}}
-  fetch('{sponsors}', {{cache: 'no-store', credentials: 'omit'}}).then(r => r.ok ? r.json() : null).then(d => {{
-    if (!d || !Array.isArray(d.sponsors)) return;
-    render(d.sponsors);
-    try {{ localStorage.setItem(key, JSON.stringify({{t: Date.now(), list: d.sponsors}})); }} catch (e) {{}}
-  }}).catch(() => {{}});
-}})();
 </script></body></html>"""
-
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -744,8 +745,30 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         self.reply(code, {"code": code, "message": message})
 
+    def secure_cookie(self):
+        return (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower() == "https"
+
+    def serve_login(self, error="", code=200):
+        nonce = secrets.token_urlsafe(16)
+        csp = (f"default-src 'none'; style-src 'nonce-{nonce}'; "
+               "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        page = LOGIN.format(nonce=nonce, error=html.escape(error)).encode()
+        return self.reply(code, page, "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
+
+    def serve_app(self):
+        nonce = secrets.token_urlsafe(16)
+        csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+               "connect-src 'self' https://raw.githubusercontent.com https://api.github.com; img-src 'self' data:; "
+               "form-action 'self'; base-uri 'none'; "
+               "frame-ancestors 'none'")
+        logout = ('<button class="link" type="submit">Sair</button>'
+                  if self.server.ui_password else "")
+        page = PAGE.format(nonce=nonce, version=VERSION, repo=REPO, releases=RELEASES, types=TYPES_JS,
+                           categories=CATEGORIES, logout=logout).encode()
+        return self.reply(200, page, "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
+
     def guard(self):
-        """Host (DNS rebinding) and Origin (cross-site posts) checks, plus the optional key."""
+        """Host (DNS rebinding) and Origin (cross-site posts) checks, plus the optional API key."""
         host = self.headers.get("Host", "")
         if not host_allowed(host):
             self.close_connection = True
@@ -757,7 +780,8 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(403, "requests from other websites are refused")
             return False
         key, path = self.server.api_key, self.path.split("?")[0]
-        if key and path not in ("/", "/api/docs", "/api/openapi.json") and not hmac.compare_digest(
+        open_paths = ("/", "/login", "/logout", "/api/docs", "/api/openapi.json")
+        if key and path not in open_paths and not hmac.compare_digest(
                 self.headers.get("X-API-Key", "").encode("latin-1", "replace"), key.encode()):  # headers arrive as latin-1
             self.fail(401, "missing or wrong X-API-Key")
             return False
@@ -825,14 +849,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/openapi.json":
             return self.reply(200, OPENAPI)
         if path == "/":
-            nonce = secrets.token_urlsafe(16)
-            csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-                   "connect-src 'self' https://raw.githubusercontent.com https://api.github.com; img-src 'self' data:; "
-                   "form-action 'self'; base-uri 'none'; "
-                   "frame-ancestors 'none'")
-            page = PAGE.format(nonce=nonce, version=VERSION, repo=REPO, sponsors=SPONSORS, releases=RELEASES, types=TYPES_JS,
-                               categories=CATEGORIES).encode()
-            return self.reply(200, page, "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
+            if not ui_session_ok(self.server.ui_password, self.headers.get("Cookie")):
+                return self.serve_login()
+            return self.serve_app()
         self.fail(404, "not found")
 
     do_HEAD = do_GET  # the same headers (X-Engine included), no body
@@ -840,7 +859,38 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.guard():
             return
-        if self.path.split("?")[0] != "/api/v1/jobs":
+        path = self.path.split("?")[0]
+        if path == "/login":
+            pw = self.server.ui_password
+            if not pw:
+                return self.reply(303, b"", "text/plain", [("Location", "/")])
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if not 0 <= n <= MAX_BODY:
+                self.close_connection = True
+                return self.fail(413 if n > MAX_BODY else 400, "the body must be 1 MB or less")
+            raw = self.rfile.read(n) if n else b""
+            form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+            password = (form.get("password") or [""])[0]
+            # Hash both sides so compare_digest never raises on unequal lengths.
+            got = hmac.new(b"gmskit-ui-login", password.encode("utf-8"), "sha256").digest()
+            want = hmac.new(b"gmskit-ui-login", pw.encode("utf-8"), "sha256").digest()
+            if not hmac.compare_digest(got, want):
+                return self.serve_login("Senha incorreta.", code=401)
+            exp = int(time.time()) + UI_TTL
+            token = ui_token(pw, exp)
+            return self.reply(303, b"", "text/plain", [
+                ("Location", "/"),
+                ("Set-Cookie", cookie_header(token, UI_TTL, self.secure_cookie())),
+            ])
+        if path == "/logout":
+            return self.reply(303, b"", "text/plain", [
+                ("Location", "/"),
+                ("Set-Cookie", cookie_header("", 0, self.secure_cookie())),
+            ])
+        if path != "/api/v1/jobs":
             return self.fail(404, "not found")
         body = self.body()
         if body is _REPLIED:
@@ -920,7 +970,7 @@ def in_container():
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
-def make_servers(port, store, worker, api_key="", host="127.0.0.1"):
+def make_servers(port, store, worker, api_key="", ui_password="", host="127.0.0.1"):
     """The server on host:port. On 127.0.0.1 also one on [::1]:port when this machine has IPv6
     loopback (Windows tries ::1 first for "localhost" and waits ~2 s before falling back)."""
     if port and port_taken(port):
@@ -932,7 +982,7 @@ def make_servers(port, store, worker, api_key="", host="127.0.0.1"):
         except OSError:
             pass
     for s in servers:
-        s.store, s.worker, s.api_key = store, worker, api_key
+        s.store, s.worker, s.api_key, s.ui_password = store, worker, api_key, ui_password
     return servers
 
 
@@ -965,7 +1015,7 @@ def main():
     headless = env["SCRAPER_HEADLESS"].strip().lower() not in ("0", "false", "no", "off")
     worker = jobs.Worker(store, log, headless=headless)
     try:
-        servers = make_servers(port, store, worker, env["SCRAPER_API_KEY"], a.host)
+        servers = make_servers(port, store, worker, env["SCRAPER_API_KEY"], env["SCRAPER_UI_PASSWORD"], a.host)
     except OSError as e:
         sys.exit(f"✗ Cannot listen on {a.host}:{port}: {e}")
     # Only now: an engine that cannot bind (another one runs on this data) must not touch its jobs.
@@ -986,8 +1036,13 @@ def main():
     chrome = browser.find_chrome()
     where = f"http://localhost:{port}" if a.host == "127.0.0.1" else \
         f"{a.host}:{port} in this container, published on the host's 127.0.0.1"
+    extras = []
+    if env["SCRAPER_API_KEY"]:
+        extras.append("API key required")
+    if env["SCRAPER_UI_PASSWORD"]:
+        extras.append("UI login required")
     log(f"engine {VERSION} on {where} (browser: {chrome or 'none found'}{'' if headless else ', as a window'}"
-        f"{', API key required' if env['SCRAPER_API_KEY'] else ''})")
+        f"{', ' + ', '.join(extras) if extras else ''})")
     if not headless and browser.always_headless(chrome):
         log("SCRAPER_HEADLESS=0 is set, but the only browser is the downloaded headless shell, which cannot "
             "open a window: install Google Chrome (or Chromium, Edge, Brave) for window mode")
