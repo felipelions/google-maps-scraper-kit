@@ -30,6 +30,7 @@ for _stream in (sys.stdout, sys.stderr):  # ✓ and accented names on a Windows 
 
 VERSION = "2.5.1"
 MARK = f"gmskit-engine/{VERSION}"  # X-Engine header: tells scripts/engine.py this engine from others
+BRAND = "GEO API - Big data"
 REPO = "https://github.com/Mahanaicoach/google-maps-scraper-kit"
 # The web UI's update notice: the browser asks GitHub for the kit's latest release once a day (a
 # public JSON endpoint, nothing about the user in the request) and shows a line when it is newer
@@ -103,9 +104,10 @@ def parse_cookies(header):
 
 
 def ui_session_ok(password, cookie_header):
-    """True when UI login is off, or the request carries a valid gmskit_ui cookie."""
+    """True only with a valid gmskit_ui cookie for the configured SCRAPER_UI_PASSWORD.
+    Without a password configured, the web UI stays locked."""
     if not password:
-        return True
+        return False
     raw = parse_cookies(cookie_header).get(UI_COOKIE, "")
     exp_s, sep, sig = raw.partition(".")
     if not sep or not exp_s.isdigit() or not sig:
@@ -300,7 +302,7 @@ def docs_page(nonce):
 
 LOGIN = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Entrar — Google Maps Scraper Kit</title>
+<title>Entrar — {brand}</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z%27/%3E%3C/svg%3E">
 <style nonce="{nonce}">
 :root {{ color-scheme: light dark; --bg: #fafafa; --fg: #171717; --muted: #737373; --border: #e5e5e5;
@@ -324,12 +326,12 @@ button:hover {{ filter: brightness(1.08); }}
 .err {{ margin: 12px 0 0; color: var(--bad); font-size: .875rem; min-height: 1.25em; }}
 </style></head><body>
 <form class="card" method="post" action="/login" id="f">
-  <h1>Google Maps Scraper Kit</h1>
-  <p class="sub">Digite a senha para acessar o painel.</p>
-  <label for="password">Senha
-    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+  <h1>{brand}</h1>
+  <p class="sub">Acesso restrito. Digite a senha para entrar.</p>
+  <label for="password">Senha de acesso
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus {disabled}>
   </label>
-  <button type="submit">Entrar</button>
+  <button type="submit" {disabled}>Entrar</button>
   <p class="err" id="err" role="status">{error}</p>
 </form>
 </body></html>"""
@@ -337,7 +339,7 @@ button:hover {{ filter: brightness(1.08); }}
 
 PAGE = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Google Maps Scraper Kit</title>
+<title>{brand}</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M12 2a7 7 0 0 0-7 7c0 5.2 7 13 7 13s7-7.8 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z%27/%3E%3C/svg%3E">
 <style nonce="{nonce}">
 :root {{ color-scheme: light dark; --bg: #fafafa; --fg: #171717; --muted: #737373; --border: #e5e5e5;
@@ -440,7 +442,7 @@ progress {{ display: block; width: 100%; max-width: 200px; height: 4px; margin-t
   td {{ padding: 2px 0; border: 0; }} td.when {{ font-size: .75rem; }} td .row {{ margin-top: 8px; }} }}
 @media (prefers-reduced-motion: reduce) {{ * {{ transition: none !important; }} }}
 </style></head><body><main>
-<header class="top"><h1>Google Maps Scraper Kit</h1>
+<header class="top"><h1>{brand}</h1>
 <nav><span class="mono">v{version}</span><a href="/api/docs">API</a>
 <form method="post" action="/logout" style="display:inline;margin:0">{logout}</form></nav></header>
 <div class="update" id="update" role="status" hidden><b>Kit v<span id="up-v"></span> disponível</b> (esta cópia é v{version}).
@@ -752,7 +754,11 @@ class Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         csp = (f"default-src 'none'; style-src 'nonce-{nonce}'; "
                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
-        page = LOGIN.format(nonce=nonce, error=html.escape(error)).encode()
+        disabled = "" if self.server.ui_password else "disabled"
+        if not error and not self.server.ui_password:
+            error = "Acesso bloqueado: defina SCRAPER_UI_PASSWORD no .env e reinicie o engine."
+        page = LOGIN.format(nonce=nonce, brand=html.escape(BRAND), error=html.escape(error),
+                            disabled=disabled).encode()
         return self.reply(code, page, "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
 
     def serve_app(self):
@@ -761,10 +767,9 @@ class Handler(BaseHTTPRequestHandler):
                "connect-src 'self' https://raw.githubusercontent.com https://api.github.com; img-src 'self' data:; "
                "form-action 'self'; base-uri 'none'; "
                "frame-ancestors 'none'")
-        logout = ('<button class="link" type="submit">Sair</button>'
-                  if self.server.ui_password else "")
-        page = PAGE.format(nonce=nonce, version=VERSION, repo=REPO, releases=RELEASES, types=TYPES_JS,
-                           categories=CATEGORIES, logout=logout).encode()
+        logout = '<button class="link" type="submit">Sair</button>'
+        page = PAGE.format(nonce=nonce, brand=html.escape(BRAND), version=VERSION, repo=REPO,
+                           releases=RELEASES, types=TYPES_JS, categories=CATEGORIES, logout=logout).encode()
         return self.reply(200, page, "text/html; charset=utf-8", [("Content-Security-Policy", csp)])
 
     def guard(self):
@@ -863,7 +868,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login":
             pw = self.server.ui_password
             if not pw:
-                return self.reply(303, b"", "text/plain", [("Location", "/")])
+                return self.serve_login(
+                    "Acesso bloqueado: defina SCRAPER_UI_PASSWORD no .env e reinicie o engine.", code=403)
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
