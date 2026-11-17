@@ -66,26 +66,45 @@ def load_types(folder=None):
 TYPES = load_types()
 TYPES_JS = json.dumps(TYPES).replace("</", "<\\/")  # the What list, inlined in the page script
 _cities, _cities_lock = None, threading.Lock()
-ENV_KEYS = ("SCRAPER_PORT", "SCRAPER_API_KEY", "SCRAPER_UI_PASSWORD", "SCRAPER_HEADLESS")
+ENV_KEYS = ("SCRAPER_PORT", "SCRAPER_API_KEY", "SCRAPER_UI_PASSWORD", "SCRAPER_ALLOWED_HOSTS", "SCRAPER_HEADLESS")
 MAX_BODY = 1 << 20
 LOCAL = r"(localhost|127\.0\.0\.1|\[::1\])"
 HOST_OK = re.compile(rf"^{LOCAL}(:\d{{1,5}})?$", re.I)
 ORIGIN_OK = re.compile(rf"^https?://{LOCAL}(:\d{{1,5}})?$", re.I)
 # Extra host names the engine answers to when it runs behind a reverse proxy (Easypanel, Traefik, nginx),
-# comma separated, without scheme or port. Default: none, so only localhost. Set SCRAPER_API_KEY too.
+# comma separated, without scheme or port. Default: none, so only localhost. Reloaded from .env in main().
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("SCRAPER_ALLOWED_HOSTS", "").split(",") if h.strip()}
 
 
+def set_allowed_hosts(hosts_csv):
+    """Replace ALLOWED_HOSTS from SCRAPER_ALLOWED_HOSTS (environment or .env)."""
+    global ALLOWED_HOSTS
+    ALLOWED_HOSTS = {h.strip().lower() for h in (hosts_csv or "").split(",") if h.strip()}
+
+
+def host_name(host):
+    """Hostname without port (and without brackets noise for comparison)."""
+    return (host or "").lower().rsplit(":", 1)[0]
+
+
 def host_allowed(host):
-    return bool(HOST_OK.match(host)) or host.lower().rsplit(":", 1)[0] in ALLOWED_HOSTS if host else False
+    return bool(HOST_OK.match(host)) or host_name(host) in ALLOWED_HOSTS if host else False
 
 
 def origin_allowed(origin, host):
+    """Allow localhost origins matching Host, same-host Origins, or Origins in SCRAPER_ALLOWED_HOSTS.
+
+    Behind Traefik/Easypanel the browser sends Origin: https://public.domain while Host may still be
+    localhost or the public name — requiring Origin host == Host broke the login POST with 403."""
     if ORIGIN_OK.match(origin) and origin.split("://", 1)[1].lower() == host.lower():
         return True
     scheme, _, rest = origin.partition("://")
-    return scheme.lower() in ("http", "https") and rest.lower().rsplit(":", 1)[0] in ALLOWED_HOSTS \
-        and rest.lower().rsplit(":", 1)[0] == host.lower().rsplit(":", 1)[0]
+    if scheme.lower() not in ("http", "https") or not rest:
+        return False
+    origin_host = host_name(rest)
+    if origin_host == host_name(host):
+        return True
+    return origin_host in ALLOWED_HOSTS
 
 
 def ui_token(password, exp):
@@ -204,8 +223,8 @@ def env_value(v):
 
 
 def read_env():
-    """SCRAPER_PORT, SCRAPER_API_KEY, SCRAPER_UI_PASSWORD and SCRAPER_HEADLESS: the environment wins, then the
-    kit's .env (last line wins, as in docker compose and scripts/scrape.py)."""
+    """SCRAPER_PORT, SCRAPER_API_KEY, SCRAPER_UI_PASSWORD, SCRAPER_ALLOWED_HOSTS and SCRAPER_HEADLESS:
+    the environment wins, then the kit's .env (last line wins, as in docker compose and scripts/scrape.py)."""
     found = {}
     try:
         with open(os.path.join(browser.KIT, ".env"), encoding="utf-8-sig", errors="replace") as f:
@@ -853,7 +872,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, find_cities(urllib.parse.parse_qs(query).get("q", [""])[0][:100]))
         if path == "/api/openapi.json":
             return self.reply(200, OPENAPI)
-        if path == "/":
+        if path in ("/", "/login"):
+            if path == "/login" and ui_session_ok(self.server.ui_password, self.headers.get("Cookie")):
+                return self.reply(303, b"", "text/plain", [("Location", "/")])
             if not ui_session_ok(self.server.ui_password, self.headers.get("Cookie")):
                 return self.serve_login()
             return self.serve_app()
@@ -1006,6 +1027,7 @@ def main():
         sys.exit("✗ --host 0.0.0.0 is for the Docker image only. On this machine the engine listens on "
                  "127.0.0.1, which keeps other machines out.")
     env = read_env()
+    set_allowed_hosts(env.get("SCRAPER_ALLOWED_HOSTS", ""))
     try:
         port = a.port or int(env["SCRAPER_PORT"] or 8080)
     except ValueError:
